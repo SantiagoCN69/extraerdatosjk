@@ -1,0 +1,19 @@
+{
+  "name": "extraerdatosjk",
+  "version": "1.0.0",
+  "description": "Este paquete contiene `actualizar-datos-animes.js`, un actualizador para la colección Firestore `datos-animes` usando datos de JKAnime. Está hecho para **Firebase Admin SDK**: no emplea credenciales web de frontend ni requiere una `apiKey` de Firebase.",
+  "main": "actualizar-datos-animes.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "axios": "^1.20.0",
+    "cheerio": "^1.2.0",
+    "dotenv": "^18.0.5",
+    "firebase-admin": "^14.5.0"
+  }
+}
