@@ -2,7 +2,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 async function obtenerSlugsDesdeUrl() {
-  const urlApi = 'https://backend-animeflv-lite.onrender.com/api/browse?source=animeav1&letter=A&status=finalizado&page=5';
+  const urlApi = 'https://backend-animeflv-lite.onrender.com/api/browse?source=animeav1&letter=B&status=finalizado&page=12';
 
 // ultimos desde la ultima carga
 //todas las sin filtros estan hechas
@@ -10,7 +10,12 @@ async function obtenerSlugsDesdeUrl() {
 //el ultimo anime de la ppagina 50 fue: fuuto tatei
 //el primero de la priemra pagina fue: battle spiruts
 
-// filtros letras: A: 4 de 13
+// A: 13 de 13
+// priemr de pag 1: azur-lane-bisoku-zenshin-ni
+// ultimode pag 13: ashita-no-joe
+
+// B: 11 de 14
+// priemr de pag 1: boku-no-hero-academia-i-am-a-hero-too
 
   try {
     const respuesta = await fetch(urlApi);
