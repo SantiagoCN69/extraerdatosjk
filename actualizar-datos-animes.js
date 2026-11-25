@@ -791,48 +791,83 @@ function allEpisodesHaveServers(episodes) {
   return Array.isArray(episodes) && episodes.length > 0 && episodes.every((episode) => Array.isArray(episode && episode.servidores) && episode.servidores.length > 0);
 }
 
-async function updateServersForDocument(snapshot, slug, position, total, details = null, options = {}) {
-  const existing = snapshot.data() || {};
-  const label = `[${position}/${total}] ${snapshot.id}`;
-  const animeDetails = details || await getAnimeDetails(slug);
+async function collectServerBlock(existingData, slug, label, animeDetails, options = {}) {
   const episodesToCheck = Array.isArray(options.episodesToCheck) ? options.episodesToCheck : (animeDetails && animeDetails.episodes) || [];
   // En modo servidores no se necesita título, portada ni sinopsis: basta con
   // identificar el anime y haber construido la lista de URLs de capítulos.
   if (!animeDetails || !animeDetails.id || episodesToCheck.length === 0) {
-    return { status: 'skipped', checked: 0, found: 0, missing: 0, added: 0, failures: 0, episodes: existing.episodios || [], blockComplete: false, reason: 'JKAnime no devolvió capítulos utilizables' };
+    return {
+      skipped: true,
+      reason: 'JKAnime no devolvió capítulos utilizables',
+      checked: 0,
+      found: 0,
+      missing: 0,
+      added: 0,
+      failures: 0,
+      episodes: (existingData && existingData.episodios) || [],
+      episodesChanged: false,
+      stateChanged: false,
+      stateToWrite: null,
+      blockComplete: false,
+      hasChanges: false,
+    };
   }
   log('INFO', `${label}: buscando servidores de ${episodesToCheck.length} capítulo(s) del bloque actual.`);
-  const result = await collectServerUpdates(existing.episodios, episodesToCheck, label, slug);
-  const mergedEpisodes = result.episodes || existing.episodios || [];
+  const result = await collectServerUpdates(existingData.episodios, episodesToCheck, label, slug);
+  const mergedEpisodes = result.episodes || existingData.episodios || [];
   const blockComplete = episodesToCheck.length > 0
     && result.stats.checked === episodesToCheck.length
     && result.stats.failures === 0
     && result.stats.withoutServers === 0
     && result.stats.withServers === episodesToCheck.length;
-  const response = {
+  const stateToWrite = blockComplete ? options.processingStateOnSuccess : options.processingStateOnRetry;
+  const episodesChanged = Boolean(result.episodes) && !sameValue(existingData.episodios, result.episodes);
+  const stateChanged = Boolean(stateToWrite) && !sameValue(existingData.procesamientoJkAnime, stateToWrite);
+  return {
+    skipped: false,
     checked: result.stats.checked,
     found: result.stats.withServers,
     missing: result.stats.withoutServers,
     added: result.stats.newServers,
     failures: result.stats.failures,
     episodes: mergedEpisodes,
+    episodesChanged,
+    stateChanged,
+    stateToWrite,
     blockComplete,
+    hasChanges: episodesChanged || stateChanged,
   };
+}
 
-  const episodesChanged = Boolean(result.episodes) && !sameValue(existing.episodios, result.episodes);
-  const stateToWrite = blockComplete ? options.processingStateOnSuccess : options.processingStateOnRetry;
-  const stateChanged = Boolean(stateToWrite) && !sameValue(existing.procesamientoJkAnime, stateToWrite);
-  if (!episodesChanged && !stateChanged) return { ...response, status: 'unchanged' };
+async function updateServersForDocument(snapshot, slug, position, total, details = null, options = {}) {
+  const existing = snapshot.data() || {};
+  const label = `[${position}/${total}] ${snapshot.id}`;
+  const animeDetails = details || await getAnimeDetails(slug);
+  const block = await collectServerBlock(existing, slug, label, animeDetails, options);
+
+  if (block.skipped) {
+    return { status: 'skipped', checked: 0, found: 0, missing: 0, added: 0, failures: 0, episodes: block.episodes, blockComplete: false, reason: block.reason };
+  }
+  const response = {
+    checked: block.checked,
+    found: block.found,
+    missing: block.missing,
+    added: block.added,
+    failures: block.failures,
+    episodes: block.episodes,
+    blockComplete: block.blockComplete,
+  };
+  if (!block.hasChanges) return { ...response, status: 'unchanged' };
   if (DRY_RUN) {
     log('INFO', `${label}: SIMULACIÓN; actualizaría servidores y/o el estado del bloque sin eliminar los existentes.`);
     return { ...response, status: 'changed' };
   }
 
   const writeData = { fechaGuardado: FieldValue.serverTimestamp() };
-  if (episodesChanged) writeData.episodios = result.episodes;
-  if (stateChanged) writeData.procesamientoJkAnime = stateToWrite;
+  if (block.episodesChanged) writeData.episodios = block.episodes;
+  if (block.stateChanged) writeData.procesamientoJkAnime = block.stateToWrite;
   await setDoc(snapshot.ref, writeData, { merge: true });
-  log('INFO', `${label}: servidores${episodesChanged ? '' : ' sin cambios'} y estado de bloque actualizados.`);
+  log('INFO', `${label}: servidores${block.episodesChanged ? '' : ' sin cambios'} y estado de bloque actualizados.`);
   return { ...response, status: 'written' };
 }
 
@@ -889,6 +924,27 @@ async function processAnime(db, snapshot, slug, position, total) {
   }
 
   log('INFO', `${label} | INICIO | slug=${slug}`);
+
+  // Escrituras diferidas: todos los cambios del run (metadatos, episodios,
+  // estado de bloques y procesadoCompleto) se acumulan en pendingWrite y se
+  // envían en una única llamada a Firestore al final del anime. Si el proceso
+  // falla, el catch intenta volcar lo acumulado como mejor esfuerzo.
+  const pendingWrite = {};
+  let hasPending = false;
+  const stageWrite = (fields) => {
+    for (const [key, value] of Object.entries(fields)) {
+      if (value === undefined) continue;
+      pendingWrite[key] = value;
+      hasPending = true;
+    }
+  };
+  const flushPending = async () => {
+    if (DRY_RUN || !hasPending) return false;
+    await setDoc(snapshot.ref, { ...pendingWrite, fechaGuardado: FieldValue.serverTimestamp() }, { merge: true });
+    hasPending = false;
+    return true;
+  };
+
   try {
     const processing = getProcessingState(existing, slug);
     let episodeStartIndex = processing.proximoIndice;
@@ -910,6 +966,9 @@ async function processAnime(db, snapshot, slug, position, total) {
 
     const candidate = normalizeAnime(details, existing);
     const fields = changedFields(existing, candidate);
+    // Estado de trabajo en memoria: existing + cambios pendientes. Evita la
+    // relectura del documento que antes hacía snapshot.ref.get().
+    let workingData = { ...existing, ...candidate };
     if (fields.length === 0) {
       summary.unchanged += 1;
       log('INFO', `${label} | METADATOS | sin cambios.`);
@@ -918,26 +977,13 @@ async function processAnime(db, snapshot, slug, position, total) {
       if (DRY_RUN) {
         log('INFO', `${label} | METADATOS | SIMULACIÓN: cambiaría ${fields.join(', ')}.`);
       } else {
-        await setDoc(snapshot.ref, { ...candidate, fechaGuardado: FieldValue.serverTimestamp() }, { merge: true });
-        summary.written += 1;
-        log('INFO', `${label} | METADATOS | guardados: ${fields.join(', ')}.`);
+        stageWrite(candidate);
+        log('INFO', `${label} | METADATOS | cambios pendientes de escritura: ${fields.join(', ')}.`);
       }
     }
 
     // El paso de servidores recibe los episodios ya combinados en metadatos.
     // Así nunca sobrescribe ni pierde capítulos que aún no tengan servidor.
-    // Importante: si se escribieron metadatos, recargar el documento para tener el estado actualizado.
-    let snapshotForServers = snapshot;
-    if (summary.written > 0) {
-      const refreshed = await snapshot.ref.get();
-      snapshotForServers = {
-        id: refreshed.id,
-        ref: refreshed.ref,
-        data: () => refreshed.data() || {},
-      };
-    }
-
-    let currentSnapshot = snapshotForServers;
     let currentDetails = details;
     let currentStartIndex = episodeStartIndex;
     let blocksProcessed = 0;
@@ -947,15 +993,11 @@ async function processAnime(db, snapshot, slug, position, total) {
     while (blocksProcessed < EPISODE_BLOCKS_PER_RUN) {
       if (!currentDetails || !Array.isArray(currentDetails.episodes) || currentDetails.episodes.length === 0) break;
 
-      // Antes de cada bloque se incorporan sus capítulos al snapshot de trabajo
+      // Antes de cada bloque se incorporan sus capítulos al estado de trabajo
       // para que los episodios sin servidor no se pierdan al mezclar resultados.
-      const baseData = currentSnapshot.data() || {};
+      const baseData = workingData;
       const episodesForBlock = mergeEpisodes(baseData.episodios, currentDetails.episodes);
-      currentSnapshot = {
-        id: currentSnapshot.id,
-        ref: currentSnapshot.ref,
-        data: () => ({ ...baseData, episodios: episodesForBlock }),
-      };
+      const dataForBlock = { ...baseData, episodios: episodesForBlock };
 
       const episodeTotal = Number.isInteger(currentDetails.episodeTotal) ? currentDetails.episodeTotal : null;
       const isFinalBlock = episodeTotal !== null
@@ -975,11 +1017,21 @@ async function processAnime(db, snapshot, slug, position, total) {
       const totalBlocks = episodeTotal !== null ? Math.ceil(episodeTotal / EPISODE_BLOCK_SIZE) : null;
       log('INFO', `${label} | SERVIDORES | bloque ${blockNumber}${totalBlocks ? `/${totalBlocks}` : ''}; comprobando ${currentDetails.episodes.length} capítulo(s) desde el índice ${currentStartIndex}.`);
 
-      const serverResult = await updateServersForDocument(currentSnapshot, slug, position, total, currentDetails, {
+      const block = await collectServerBlock(dataForBlock, slug, label, currentDetails, {
         episodesToCheck: currentDetails.episodes,
         processingStateOnSuccess: successState,
         processingStateOnRetry: retryState,
       });
+      const serverResult = {
+        checked: block.checked,
+        found: block.found,
+        missing: block.missing,
+        added: block.added,
+        failures: block.failures,
+        episodes: block.episodes,
+        blockComplete: block.blockComplete,
+        status: block.skipped ? 'skipped' : (block.hasChanges ? 'changed' : 'unchanged'),
+      };
       summary[serverResult.status] += 1;
       summary.checked += serverResult.checked;
       summary.found += serverResult.found;
@@ -990,15 +1042,16 @@ async function processAnime(db, snapshot, slug, position, total) {
       lastServerResult = serverResult;
       reachedFinalBlock = isFinalBlock;
       const stateAfterBlock = serverResult.blockComplete ? successState : retryState;
-      const previousData = currentSnapshot.data() || {};
-      currentSnapshot = {
-        id: currentSnapshot.id,
-        ref: currentSnapshot.ref,
-        data: () => ({
-          ...previousData,
-          episodios: serverResult.episodes || episodesForBlock,
-          procesamientoJkAnime: stateAfterBlock,
-        }),
+      // Las escrituras se difieren: solo se acumulan los campos que cambiaron
+      // respecto al estado de trabajo y se envían en una única llamada al final.
+      if (!block.skipped && block.hasChanges && !DRY_RUN) {
+        if (block.episodesChanged) stageWrite({ episodios: block.episodes });
+        if (block.stateChanged) stageWrite({ procesamientoJkAnime: block.stateToWrite });
+      }
+      workingData = {
+        ...dataForBlock,
+        episodios: serverResult.episodes || episodesForBlock,
+        procesamientoJkAnime: stateAfterBlock,
       };
 
       if (!serverResult.blockComplete || isFinalBlock || blocksProcessed + 1 >= EPISODE_BLOCKS_PER_RUN) break;
@@ -1016,28 +1069,27 @@ async function processAnime(db, snapshot, slug, position, total) {
     }
 
     if (!lastServerResult) {
-      const currentData = currentSnapshot.data() || {};
       const caughtUp = Number.isInteger(details.episodeTotal) && episodeStartIndex >= details.episodeTotal;
       const canComplete = caughtUp
-        && allEpisodesHaveServers(currentData.episodios)
+        && allEpisodesHaveServers(workingData.episodios)
         && String(details.status || '').toLowerCase().includes('concluido');
       if (canComplete) {
         if (DRY_RUN) {
           log('INFO', `${label} | COMPLETADO | SIMULACIÓN: se marcaría porque ya no quedan bloques pendientes.`);
         } else {
-          await setDoc(snapshot.ref, { procesadoCompleto: true, fechaGuardado: FieldValue.serverTimestamp() }, { merge: true });
-          summary.written += 1;
-          log('INFO', `${label} | COMPLETADO | marcado al detectar que ya no quedan bloques pendientes.`);
+          stageWrite({ procesadoCompleto: true });
+          log('INFO', `${label} | COMPLETADO | se marcará al consolidar la escritura final.`);
         }
       } else {
         log('INFO', `${label} | SERVIDORES | sin capítulos nuevos; el anime está al día o aún no hay bloques pendientes.`);
       }
+      if (await flushPending()) summary.written += 1;
       log('INFO', `${label} | FIN | capítulos=0 | conServidores=0 | sinServidores=0 | fallos=0.`);
       return summary;
     }
 
     if (!reachedFinalBlock) {
-      const state = currentSnapshot.data().procesamientoJkAnime || {};
+      const state = workingData.procesamientoJkAnime || {};
       const nextIndex = Number.isInteger(state.proximoIndice) ? state.proximoIndice : currentStartIndex;
       const total = Number.isInteger(state.totalEpisodios) ? state.totalEpisodios : null;
       log('INFO', `${label} | BLOQUE | último bloque procesado; próximo índice=${nextIndex}${total !== null ? ` de ${total}` : ''}; quedan bloques pendientes.`);
@@ -1048,15 +1100,22 @@ async function processAnime(db, snapshot, slug, position, total) {
       } else if (DRY_RUN) {
         log('INFO', `${label} | COMPLETADO | SIMULACIÓN: se marcaría tras completar el último bloque.`);
       } else {
-        await setDoc(snapshot.ref, { procesadoCompleto: true, fechaGuardado: FieldValue.serverTimestamp() }, { merge: true });
-        summary.written += 1;
-        log('INFO', `${label} | COMPLETADO | marcado al finalizar el último bloque.`);
+        stageWrite({ procesadoCompleto: true });
+        log('INFO', `${label} | COMPLETADO | se marcará al consolidar la escritura final.`);
       }
     }
+    if (await flushPending()) summary.written += 1;
     log('INFO', `${label} | FIN | capítulos=${summary.checked} | conServidores=${summary.found} | sinServidores=${summary.missing} | fallos=${summary.episodeFailures}.`);
   } catch (error) {
     summary.errors += 1;
-    log('ERROR', `${label} | FIN | ${safeError(error)}. Documento intacto.`);
+    let partialFlush = false;
+    try {
+      partialFlush = await flushPending();
+      if (partialFlush) summary.written += 1;
+    } catch (_) {
+      // Si la escritura consolidada falla, el documento permanece intacto.
+    }
+    log('ERROR', `${label} | FIN | ${safeError(error)}.${partialFlush ? ' Progreso parcial guardado.' : ' Documento intacto.'}`);
   }
   return summary;
 }

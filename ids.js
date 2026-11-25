@@ -2,7 +2,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 async function obtenerSlugsDesdeUrl() {
-  const urlApi = 'https://backend-animeflv-lite.onrender.com/api/browse?source=animeav1&letter=B&status=finalizado&page=14';
+  const urlApi = 'https://backend-animeflv-lite.onrender.com/api/browse?source=animeav1&letter=C&status=finalizado&page=5';
 
 // ultimos desde la ultima carga
 //todas las sin filtros estan hechas
@@ -14,8 +14,13 @@ async function obtenerSlugsDesdeUrl() {
 // priemr de pag 1: azur-lane-bisoku-zenshin-ni
 // ultimode pag 13: ashita-no-joe
 
-// B: 13 de 14
+// B: 14 de 14
 // priemr de pag 1: boku-no-hero-academia-i-am-a-hero-too
+// ultimo de pag 14: bubblegum-crisis
+
+// C: 4 de 9
+// priemr de pag 1: cleavetess
+// ultimo de pag 9: 
 
   try {
     const respuesta = await fetch(urlApi);
